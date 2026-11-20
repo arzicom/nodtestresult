@@ -1,0 +1,220 @@
+{
+  "name": "Учёт продаж из Telegram · Разбор по правилам",
+  "nodes": [
+    {
+      "name": "Telegram: рабочий вход",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.5,
+      "position": [
+        0,
+        0
+      ],
+      "id": "167454ab-ec56-4374-a97c-eb1f3f524347",
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {
+          "download": false
+        }
+      },
+      "disabled": true
+    },
+    {
+      "name": "Только владелец",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        230,
+        0
+      ],
+      "id": "0353d216-9196-466a-89cf-fa1175273fb5",
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const OWNER_ID = ''; // Укажите разрешённый Telegram ID в приватной копии.\nconst m = $input.first().json.message;\nif (!/^[1-9]\\d+$/.test(OWNER_ID) || m?.chat?.type !== 'private' || String(m.from?.id) !== OWNER_ID || String(m.chat.id) !== OWNER_ID || m.from.is_bot !== false) return [];\nif (typeof m.text !== 'string' || !m.text.trim() || m.text.trimStart().startsWith('/') || !Number.isSafeInteger(m.date) || m.date <= 0 || m.date > 4102444800 || !Number.isSafeInteger(m.message_id) || m.message_id <= 0) return [];\nreturn [{json:{message:m}}];"
+      }
+    },
+    {
+      "name": "Разобрать сообщение",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        0
+      ],
+      "id": "3c62c6b3-12c7-495b-971d-4a13c2cd7d8c",
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Часовой пояс журнала: по умолчанию UTC. При необходимости задайте своё смещение в минутах.\nconst REPORT_UTC_OFFSET_MINUTES = 0;\nfunction parse(m) {\n  const original = m.text;\n  const text = original.normalize('NFKC').replace(/\\s+/g, ' ').trim();\n  const received = new Date(m.date * 1000 + REPORT_UTC_OFFSET_MINUTES * 60000).toISOString().slice(0,10);\n  const result = {id:`tg:${m.chat.id}:${m.message_id}`, date:received, month:received.slice(0,7), kind:'На проверке', model:'', amount:'', link:'', original, note:'', reply:m.reply_to_message?.message_id || null};\n  const review = reason => ({...result, note:reason});\n  const months = ['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];\n  const dateRx = new RegExp('^(\\\\d{1,2}) ('+months.join('|')+')(?: (\\\\d{4})(?: г\\\\.?)?)?\\\\s*[,;]?\\\\s+', 'iu');\n  const d = text.match(dateRx);\n  if (!d) return review('Нужна дата в начале сообщения: например, 8 февраля.');\n  const month = months.indexOf(d[2].toLowerCase()) + 1;\n  const dateFor = y => `${y}-${String(month).padStart(2,'0')}-${d[1].padStart(2,'0')}`;\n  let year = d[3] ? Number(d[3]) : Number(received.slice(0,4));\n  if (!d[3] && dateFor(year) > received) return review('Дата без года позже даты сообщения. Укажите год.');\n  const date = dateFor(year);\n  const stamp = new Date(date + 'T00:00:00Z');\n  if (year < 1900 || !Number.isFinite(stamp.getTime()) || stamp.toISOString().slice(0,10) !== date || date > received) return review('Неверная или будущая дата события.');\n  result.date = date;\n  result.month = date.slice(0,7);\n  const rest = text.slice(d[0].length);\n  const negative = /(?:не\\s+продал[аи]?|(?:отмен[а-яё]+|сорвал[а-яё]*|перен[её]с[а-яё]*|возврат[а-яё]*)|не\\s+(?:совершен[а-яё]*|состоял[а-яё]*|заверш[а-яё]*))/iu;\n  const sale = 'продал(?:а|и)?';\n  const request = '(?:договорил(?:ся|ась|ись) по заявке о продаже|(?:поступила|получил(?:а|и)?) заявка на продажу)';\n  const classify = new RegExp('^(' + sale + '|' + request + ') (?:автомобил[ья] )?(.+?) за (\\\\d{1,3}(?: \\\\d{3})+|\\\\d+)([,.]\\\\d{1,2})? *(млн\\\\.?|миллион(?:а|ов)?|тыс\\\\.?|тысяч(?:а|и)?)? *(руб(?:лей|ля|ль)?\\\\.?|₽)(.*)$', 'iu');\n  const match = rest.match(classify);\n  if (!match) return review('Не удалось однозначно разобрать тип, автомобиль и сумму в рублях.');\n  const [,verb,model,whole,fraction,unit,currency,tail] = match;\n  const isSale = new RegExp('^'+sale+'$', 'iu').test(verb);\n  const cleanTail = tail.trim().replace(/^[.!]\\s*/, '').replace(/[.!]$/, '').trim();\n  if (cleanTail && !( !isSale && /^сделка (?:еще |ещё |пока )?не (?:совершена|состоялась|завершена)$/iu.test(cleanTail))) return review('Есть дополнительные условия или неясный статус.');\n  if (negative.test(rest.slice(0,rest.length - tail.length)) || !/^[\\p{L}\\p{N}][\\p{L}\\p{N} .+–-]{1,79}$/u.test(model)) return review('Неоднозначный статус или название автомобиля.');\n  const value = Number(whole.replace(/ /g,'') + (fraction || '').replace(',','.'));\n  const mult = /^м/iu.test(unit || '') ? 1000000 : /^т/iu.test(unit || '') ? 1000 : 1;\n  const amount = Math.round(value * mult * 100) / 100;\n  if (!Number.isFinite(amount) || amount <= 0 || amount > 1e10) return review('Проверьте сумму.');\n  return {...result,kind:isSale?'Продажа':'Заявка',model:model.trim(),amount};\n}\n\nreturn $input.all().map(({json})=>({json:parse(json.message)}));"
+      }
+    },
+    {
+      "name": "Прочитать журнал",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        690,
+        0
+      ],
+      "id": "41b2db5c-9eb8-44ff-b967-1d3288d39830",
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "method": "GET",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/REPLACE_WITH_SPREADSHEET_ID/values/SalesLog!A%3AI?valueRenderOption=UNFORMATTED_VALUE"
+      },
+      "disabled": true
+    },
+    {
+      "name": "Проверить ID и связь",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        920,
+        0
+      ],
+      "id": "83ecabde-bad1-4a1e-a251-2041ceea484c",
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const values = $input.first().json.values;\nif (!Array.isArray(values) || values[0]?.[0] !== 'ID сообщения' || values[0]?.[6] !== 'ID заявки (если связан)') throw new Error('Проверьте шапку листа SalesLog.');\nconst p = $('Разобрать сообщение').first().json;\nconst rows = values.slice(1);\nif (rows.some(r => r[0] === p.id)) return [];\nif (p.reply && p.kind === 'Продажа') {\n  const parent = p.id.replace(/:\\d+$/, ':' + p.reply);\n  const found = rows.filter(r => r[0] === parent && r[3] === 'Заявка');\n  const normalize = s => String(s).normalize('NFKC').replace(/\\s+/g,' ').trim().toLowerCase();\n  if (found.length === 1 && normalize(found[0][4]) === normalize(p.model) && found[0][1] <= p.date && !rows.some(r => r[3] === 'Продажа' && r[6] === parent)) p.link = parent;\n  else { p.kind = 'На проверке'; p.note = 'Ответ на сообщение: связь с заявкой не подтверждена. Проверьте вручную.'; }\n}\nreturn [{json:{values:[[p.id,p.date,p.month,p.kind,p.model,p.amount,p.link,p.original,p.note]]}}];\n"
+      }
+    },
+    {
+      "name": "Записать RAW",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1150,
+        0
+      ],
+      "id": "cb240208-df09-45eb-b1ef-27ec8416c216",
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "method": "POST",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/REPLACE_WITH_SPREADSHEET_ID/values/SalesLog!A%3AI:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({values: $json.values}) }}"
+      },
+      "disabled": true
+    },
+    {
+      "name": "Ручной тест без Telegram",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        290
+      ],
+      "id": "05b65072-8c7e-40ec-8f13-3db0ec67b83c",
+      "parameters": {}
+    },
+    {
+      "name": "Проверить два примера",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        230,
+        290
+      ],
+      "id": "7093f69b-5a3b-4693-8a13-67cbdd83ff59",
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Часовой пояс журнала: по умолчанию UTC. При необходимости задайте своё смещение в минутах.\nconst REPORT_UTC_OFFSET_MINUTES = 0;\nfunction parse(m) {\n  const original = m.text;\n  const text = original.normalize('NFKC').replace(/\\s+/g, ' ').trim();\n  const received = new Date(m.date * 1000 + REPORT_UTC_OFFSET_MINUTES * 60000).toISOString().slice(0,10);\n  const result = {id:`tg:${m.chat.id}:${m.message_id}`, date:received, month:received.slice(0,7), kind:'На проверке', model:'', amount:'', link:'', original, note:'', reply:m.reply_to_message?.message_id || null};\n  const review = reason => ({...result, note:reason});\n  const months = ['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];\n  const dateRx = new RegExp('^(\\\\d{1,2}) ('+months.join('|')+')(?: (\\\\d{4})(?: г\\\\.?)?)?\\\\s*[,;]?\\\\s+', 'iu');\n  const d = text.match(dateRx);\n  if (!d) return review('Нужна дата в начале сообщения: например, 8 февраля.');\n  const month = months.indexOf(d[2].toLowerCase()) + 1;\n  const dateFor = y => `${y}-${String(month).padStart(2,'0')}-${d[1].padStart(2,'0')}`;\n  let year = d[3] ? Number(d[3]) : Number(received.slice(0,4));\n  if (!d[3] && dateFor(year) > received) return review('Дата без года позже даты сообщения. Укажите год.');\n  const date = dateFor(year);\n  const stamp = new Date(date + 'T00:00:00Z');\n  if (year < 1900 || !Number.isFinite(stamp.getTime()) || stamp.toISOString().slice(0,10) !== date || date > received) return review('Неверная или будущая дата события.');\n  result.date = date;\n  result.month = date.slice(0,7);\n  const rest = text.slice(d[0].length);\n  const negative = /(?:не\\s+продал[аи]?|(?:отмен[а-яё]+|сорвал[а-яё]*|перен[её]с[а-яё]*|возврат[а-яё]*)|не\\s+(?:совершен[а-яё]*|состоял[а-яё]*|заверш[а-яё]*))/iu;\n  const sale = 'продал(?:а|и)?';\n  const request = '(?:договорил(?:ся|ась|ись) по заявке о продаже|(?:поступила|получил(?:а|и)?) заявка на продажу)';\n  const classify = new RegExp('^(' + sale + '|' + request + ') (?:автомобил[ья] )?(.+?) за (\\\\d{1,3}(?: \\\\d{3})+|\\\\d+)([,.]\\\\d{1,2})? *(млн\\\\.?|миллион(?:а|ов)?|тыс\\\\.?|тысяч(?:а|и)?)? *(руб(?:лей|ля|ль)?\\\\.?|₽)(.*)$', 'iu');\n  const match = rest.match(classify);\n  if (!match) return review('Не удалось однозначно разобрать тип, автомобиль и сумму в рублях.');\n  const [,verb,model,whole,fraction,unit,currency,tail] = match;\n  const isSale = new RegExp('^'+sale+'$', 'iu').test(verb);\n  const cleanTail = tail.trim().replace(/^[.!]\\s*/, '').replace(/[.!]$/, '').trim();\n  if (cleanTail && !( !isSale && /^сделка (?:еще |ещё |пока )?не (?:совершена|состоялась|завершена)$/iu.test(cleanTail))) return review('Есть дополнительные условия или неясный статус.');\n  if (negative.test(rest.slice(0,rest.length - tail.length)) || !/^[\\p{L}\\p{N}][\\p{L}\\p{N} .+–-]{1,79}$/u.test(model)) return review('Неоднозначный статус или название автомобиля.');\n  const value = Number(whole.replace(/ /g,'') + (fraction || '').replace(',','.'));\n  const mult = /^м/iu.test(unit || '') ? 1000000 : /^т/iu.test(unit || '') ? 1000 : 1;\n  const amount = Math.round(value * mult * 100) / 100;\n  if (!Number.isFinite(amount) || amount <= 0 || amount > 1e10) return review('Проверьте сумму.');\n  return {...result,kind:isSale?'Продажа':'Заявка',model:model.trim(),amount};\n}\n\n// Вымышленные данные только для локального ручного теста.\nconst samples = [\"3 февраля поступила заявка на продажу автомобиля Демо Альфа за 120 тыс. руб.\", \"8 февраля продал Демо Бета за 230 тыс. руб.\"].map((text, i) => ({text, date:Date.UTC(2030, 1, 15) / 1000, chat:{id:1}, message_id:i+1}));\nconst rows = samples.map(parse);\nif (rows[0].kind !== 'Заявка' || rows[0].amount !== 120000 || rows[1].kind !== 'Продажа' || rows[1].amount !== 230000 || rows.some((r,i)=>r.date !== ['2030-02-03','2030-02-08'][i])) throw new Error('Не совпали контрольные результаты.');\nreturn rows.map(json=>({json}));"
+      }
+    },
+    {
+      "name": "Настройка после импорта",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        490
+      ],
+      "id": "9b72f405-f654-4a3a-a876-b8ffaa94508f",
+      "parameters": {
+        "width": 760,
+        "height": 430,
+        "content": "## Настройка после импорта\n\n1. В узле «Только владелец» заполните `OWNER_ID` своим Telegram ID. Пустое значение блокирует все сообщения. В Telegram Trigger подключите своего бота и укажите тот же ID в фильтрах Chat IDs и User IDs.\n2. Создайте лист `SalesLog`. Заголовки A1:I1:\n\n   ID сообщения | Дата события | Месяц отчёта | Тип | Автомобиль | Сумма, ₽ | ID заявки (если связан) | Исходный текст | Причина проверки\n\n3. В узлах «Прочитать журнал» и «Записать RAW» замените `REPLACE_WITH_SPREADSHEET_ID` и подключите свои Google Sheets OAuth2 credentials. При необходимости настройте `REPORT_UTC_OFFSET_MINUTES` в коде разбора.\n\n4. Ручная ветка проверяет правила на вымышленных данных и не обращается к Google Sheets.\n\nСначала настройте и проверьте всё на отдельном боте и листе. Затем включите три отключённых узла и публикуйте только после проверки, что у бота нет другого обработчика webhook."
+      }
+    }
+  ],
+  "connections": {
+    "Telegram: рабочий вход": {
+      "main": [
+        [
+          {
+            "node": "Только владелец",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Только владелец": {
+      "main": [
+        [
+          {
+            "node": "Разобрать сообщение",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Разобрать сообщение": {
+      "main": [
+        [
+          {
+            "node": "Прочитать журнал",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Прочитать журнал": {
+      "main": [
+        [
+          {
+            "node": "Проверить ID и связь",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Проверить ID и связь": {
+      "main": [
+        [
+          {
+            "node": "Записать RAW",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ручной тест без Telegram": {
+      "main": [
+        [
+          {
+            "node": "Проверить два примера",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
